@@ -20,6 +20,8 @@ Selector 一览
 -------------
 - ``B1Selector``          KDJ 分位 + 知行线 + 周线多头排列
 - ``BrickChartSelector``  砖型图形态 + 知行线 + 周线多头排列
+- ``GoldenNeedleSelector`` 黄金针/白金针 RSL 形态
+- ``KGMomentumSelector``  KG/JRX 动能反转与趋势延续形态
 """
 from __future__ import annotations
 
@@ -242,6 +244,260 @@ def compute_brick_chart(
     )
     return pd.Series(arr, index=df.index, name="brick")
 
+
+def _rolling_count(cond: pd.Series, window: int) -> pd.Series:
+    """通达信 COUNT(cond, window) 等价实现。"""
+    return cond.astype(int).rolling(window, min_periods=window).sum()
+
+
+def _rolling_every(cond: pd.Series, window: int) -> pd.Series:
+    """通达信 EVERY(cond, window) 等价实现。"""
+    return _rolling_count(cond, window) == window
+
+
+def compute_golden_needle(
+    df: pd.DataFrame,
+    *,
+    n1: int = 3,
+    n2: int = 21,
+    cond1_long_min: float = 79.0,
+    cond1_short_max: float = 30.0,
+    cond2_gap_min: float = 58.0,
+    cond2_long_min: float = 70.0,
+    cond3_count_window: int = 5,
+    cond3_count_min: int = 3,
+    cond3_long_window: int = 6,
+    cond3_long_min: float = 80.0,
+    cond3_short_max: float = 70.0,
+    cond4_count_window: int = 3,
+    cond4_count_min: int = 2,
+    cond4_long_window: int = 4,
+    cond4_long_min: float = 80.0,
+    cond4_short_max: float = 60.0,
+    cond5_long_min: float = 75.0,
+    cond5_short_max: float = 50.0,
+    cond6_count_window: int = 8,
+    cond6_count_min: int = 4,
+    cond6_count_short_max: float = 75.0,
+    cond6_long_window: int = 9,
+    cond6_long_min: float = 85.0,
+    cond6_short_max: float = 60.0,
+) -> pd.DataFrame:
+    """
+    通达信黄金针公式的向量化 Python 版本。
+
+    短期 = 100 * (C - LLV(L, N1)) / (HHV(C, N1) - LLV(L, N1))
+    长期 = 100 * (C - LLV(L, N2)) / (HHV(C, N2) - LLV(L, N2))
+
+    返回列：
+      - needle_short / needle_long
+      - needle_cond1 ... needle_cond6
+      - golden_needle: COND1 OR COND2
+      - platinum_needle: COND3 OR COND4 OR COND5 OR COND6
+      - golden_needle_pick: 六个条件任一触发
+    """
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    close = out["close"].astype(float)
+    low = out["low"].astype(float)
+
+    llv1 = low.rolling(n1, min_periods=n1).min()
+    hhv1 = close.rolling(n1, min_periods=n1).max()
+    llv2 = low.rolling(n2, min_periods=n2).min()
+    hhv2 = close.rolling(n2, min_periods=n2).max()
+
+    short_den = (hhv1 - llv1).replace(0, np.nan)
+    long_den = (hhv2 - llv2).replace(0, np.nan)
+    short = 100.0 * (close - llv1) / short_den
+    long = 100.0 * (close - llv2) / long_den
+
+    cond1 = (long >= cond1_long_min) & (short <= cond1_short_max)
+    cond2 = ((long - short) > cond2_gap_min) & (long > cond2_long_min)
+    cond3 = (
+        (_rolling_count(short < cond3_short_max, cond3_count_window) >= cond3_count_min)
+        & _rolling_every(long > cond3_long_min, cond3_long_window)
+        & (short < cond3_short_max)
+    )
+    cond4 = (
+        (_rolling_count(short < cond4_short_max, cond4_count_window) >= cond4_count_min)
+        & _rolling_every(long > cond4_long_min, cond4_long_window)
+        & (short < cond4_short_max)
+    )
+    cond5 = (cond1 | cond2).shift(1, fill_value=False) & (long > cond5_long_min) & (short < cond5_short_max)
+    cond6 = (
+        (_rolling_count(short < cond6_count_short_max, cond6_count_window) >= cond6_count_min)
+        & _rolling_every(long > cond6_long_min, cond6_long_window)
+        & (short < cond6_short_max)
+    )
+
+    out["needle_short"] = short
+    out["needle_long"] = long
+    out["needle_cond1"] = cond1.fillna(False)
+    out["needle_cond2"] = cond2.fillna(False)
+    out["needle_cond3"] = cond3.fillna(False)
+    out["needle_cond4"] = cond4.fillna(False)
+    out["needle_cond5"] = cond5.fillna(False)
+    out["needle_cond6"] = cond6.fillna(False)
+    out["golden_needle"] = out["needle_cond1"] | out["needle_cond2"]
+    out["platinum_needle"] = (
+        out["needle_cond3"]
+        | out["needle_cond4"]
+        | out["needle_cond5"]
+        | out["needle_cond6"]
+    )
+    out["golden_needle_pick"] = out["golden_needle"] | out["platinum_needle"]
+    return out
+
+
+def compute_kg_momentum(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    KG/JRX 动能 V3 BETA 的向量化实现。
+
+    核心输出：
+      - kg_momentum: 基础动能（黄柱）
+      - kg_x_momentum: X 动能（红柱）
+      - kg_score: 真实得分（蓝色虚线原值，未加视觉偏移 +10）
+      - kg_pick_reversal / kg_pick_momentum_rebound / kg_pick_trend_continue
+    """
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    close = out["close"].astype(float)
+    open_ = out["open"].astype(float)
+    high = out["high"].astype(float)
+    low = out["low"].astype(float)
+    volume = out["volume"].astype(float)
+
+    lc = close.shift(1)
+    diff = close - lc
+
+    sma1 = _tdx_sma(diff.clip(lower=0), 3, 1)
+    sma2 = _tdx_sma(diff.abs(), 3, 1)
+    rsi3 = (sma1 / sma2.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    llv9 = low.rolling(9, min_periods=1).min()
+    hhv9 = high.rolling(9, min_periods=1).max()
+    rsv_denom = hhv9 - llv9
+    rsv = ((close - llv9) / rsv_denom.replace(0, np.nan) * 100.0).fillna(50.0)
+    k_val = _tdx_sma(rsv, 3, 1)
+    d_val = _tdx_sma(k_val, 3, 1)
+    j_val = 3.0 * k_val - 2.0 * d_val
+
+    n1 = j_val - j_val.shift(1)
+    n2 = rsi3 - rsi3.shift(1)
+
+    pctchg = ((close - lc) / lc.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan)
+    vol_ratio = (volume / volume.shift(1).replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    true_bull = (close > open_) & (close > lc)
+
+    mino_refc = pd.concat([open_, lc], axis=1).min(axis=1)
+    sdenom = high - mino_refc
+    upper_shadow_ratio = ((high - close) / sdenom.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    candle_min = pd.concat([open_, close], axis=1).min(axis=1)
+    day_range = high - low
+    lower_shadow_ratio = ((candle_min - low) / day_range.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    vol_slope = (1.2 - 1.0) / (6.0 - 2.5)
+    vol_boost = pd.Series(1.0, index=out.index)
+    vol_boost = vol_boost.where(~(true_bull & (vol_ratio >= 2.5)), 1.0 + vol_slope * (vol_ratio - 2.5))
+    vol_boost = vol_boost.where(~(true_bull & (vol_ratio >= 6.0)), 1.2)
+
+    shadow_factor = pd.Series(1.0, index=out.index)
+    shadow_factor = shadow_factor.where(~true_bull, (0.70 - upper_shadow_ratio) * 1.3)
+
+    base_momentum = (n1 + n2) / 2.0 * shadow_factor * vol_boost
+    x_diff = (n1 + n2) - (n1.shift(1) + n2.shift(1))
+    x_momentum = pd.Series(
+        np.where(true_bull & (x_diff > 0), x_diff / 2.0 * shadow_factor * vol_boost, 0.0),
+        index=out.index,
+    )
+
+    ret_mean = pctchg.rolling(45, min_periods=45).mean()
+    ret_std = pctchg.rolling(45, min_periods=45).std()
+    ret_z = ((pctchg - ret_mean) / ret_std.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    vol_mean45 = volume.rolling(45, min_periods=45).mean()
+    vol_ratio_ma = (volume / vol_mean45.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+    llv20 = low.rolling(20, min_periods=20).min()
+    hhv20 = high.rolling(20, min_periods=20).max()
+    high_pos = ((high - llv20) / (hhv20 - llv20).replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    true_bear = (open_ > close) & (close < lc)
+    fake_bear_bull = (open_ > close) & (close >= lc)
+    real_overhead_flow = pd.Series(
+        np.where(true_bear, high_pos * vol_ratio_ma * np.maximum(0.0, -ret_z), 0.0),
+        index=out.index,
+    )
+    fake_bear_drop = ((open_ - close) / lc.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    fake_overhead_flow = pd.Series(
+        np.where(fake_bear_bull, high_pos * vol_ratio_ma * fake_bear_drop * 0.1, 0.0),
+        index=out.index,
+    )
+    overhead_v20 = (real_overhead_flow + fake_overhead_flow).rolling(20, min_periods=20).sum().shift(1)
+
+    bonus_ratio = ((vol_ratio - 5.0) / 5.0).clip(lower=0.0, upper=1.0)
+    j_norm = ((j_val.shift(1) - 19.0) / 11.0).clip(lower=0.0, upper=1.0)
+    rsi_norm = ((rsi3.shift(1) - 29.0) / 11.0).clip(lower=0.0, upper=1.0)
+    z_norm = ((ret_z - 2.5) / 0.7).clip(lower=0.0, upper=1.0)
+    v20_norm = ((overhead_v20 - 2.0) / 8.0).clip(lower=0.0, upper=1.0)
+
+    total_penalty = 20.0 * j_norm + 30.0 * rsi_norm + 10.0 * z_norm + 35.0 * v20_norm
+    score = base_momentum + bonus_ratio * 15.0 - total_penalty
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    ma20_slope5 = ma20 / ma20.shift(5) - 1.0
+    ma60_slope5 = ma60 / ma60.shift(5) - 1.0
+    ret20 = close / close.shift(20) - 1.0
+    ret60 = close / close.shift(60) - 1.0
+    low20 = low.rolling(20, min_periods=20).min()
+    low20_distance = close / low20.replace(0, np.nan) - 1.0
+
+    out["kg_rsi3"] = rsi3
+    out["kg_j"] = j_val
+    out["kg_j_delta"] = n1
+    out["kg_rsi_delta"] = n2
+    out["kg_vol_ratio"] = vol_ratio
+    out["kg_true_bull"] = true_bull.fillna(False)
+    out["kg_upper_shadow_ratio"] = upper_shadow_ratio
+    out["kg_lower_shadow_ratio"] = lower_shadow_ratio
+    out["kg_shadow_factor"] = shadow_factor
+    out["kg_vol_boost"] = vol_boost
+    out["kg_momentum"] = base_momentum
+    out["kg_x_momentum"] = x_momentum
+    out["kg_ret_z"] = ret_z
+    out["kg_overhead_v20"] = overhead_v20
+    out["kg_bonus_ratio"] = bonus_ratio
+    out["kg_j_norm"] = j_norm
+    out["kg_rsi_norm"] = rsi_norm
+    out["kg_z_norm"] = z_norm
+    out["kg_v20_norm"] = v20_norm
+    out["kg_total_penalty"] = total_penalty
+    out["kg_score"] = score
+    out["kg_ma20"] = ma20
+    out["kg_ma60"] = ma60
+    out["kg_ma20_slope5"] = ma20_slope5
+    out["kg_ma60_slope5"] = ma60_slope5
+    out["kg_ret20"] = ret20
+    out["kg_ret60"] = ret60
+    out["kg_low20_distance"] = low20_distance
+    out["kg_pick_reversal"] = (base_momentum < 20.0) & (x_momentum >= 50.0)
+    out["kg_pick_momentum_rebound"] = (
+        base_momentum.between(30.0, 50.0)
+        & x_momentum.between(30.0, 50.0)
+        & score.between(10.0, 50.0)
+    )
+    out["kg_pick_trend_continue"] = (
+        out["kg_pick_momentum_rebound"]
+        & (close > ma20)
+        & (ma20_slope5 >= 0.0)
+    )
+    out["kg_pick"] = out["kg_pick_reversal"] | out["kg_pick_trend_continue"]
+    return out
 
 
 # =============================================================================
@@ -672,6 +928,154 @@ class ZXDQRatioFilter:
         )
 
 
+@dataclass(frozen=True)
+class GoldenNeedlePatternFilter:
+    """黄金针/白金针信号过滤器。"""
+    include_platinum: bool = True
+    n1: int = 3
+    n2: int = 21
+    cond1_long_min: float = 79.0
+    cond1_short_max: float = 30.0
+    cond2_gap_min: float = 58.0
+    cond2_long_min: float = 70.0
+    cond6_count_window: int = 8
+    cond6_count_min: int = 4
+    cond6_count_short_max: float = 75.0
+    cond6_long_window: int = 9
+    cond6_long_min: float = 85.0
+    cond6_short_max: float = 60.0
+
+    def _compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        return compute_golden_needle(
+            df,
+            n1=self.n1,
+            n2=self.n2,
+            cond1_long_min=self.cond1_long_min,
+            cond1_short_max=self.cond1_short_max,
+            cond2_gap_min=self.cond2_gap_min,
+            cond2_long_min=self.cond2_long_min,
+            cond6_count_window=self.cond6_count_window,
+            cond6_count_min=self.cond6_count_min,
+            cond6_count_short_max=self.cond6_count_short_max,
+            cond6_long_window=self.cond6_long_window,
+            cond6_long_min=self.cond6_long_min,
+            cond6_short_max=self.cond6_short_max,
+        )
+
+    def __call__(self, hist: pd.DataFrame) -> bool:
+        if hist.empty:
+            return False
+        if "golden_needle_pick" not in hist.columns:
+            hist = self._compute(hist)
+        latest = hist.iloc[-1]
+        if self.include_platinum:
+            return bool(latest.get("golden_needle_pick", False))
+        return bool(latest.get("golden_needle", False))
+
+    def vec_mask(self, df: pd.DataFrame) -> np.ndarray:
+        col = "golden_needle_pick" if self.include_platinum else "golden_needle"
+        if col not in df.columns:
+            df = self._compute(df)
+        return df[col].to_numpy(dtype=bool)
+
+
+@dataclass(frozen=True)
+class KGMomentumPatternFilter:
+    """KG/JRX 动能信号过滤器。"""
+    mode: str = "both"
+    reversal_momentum_max: float = 20.0
+    reversal_x_min: float = 50.0
+    trend_momentum_min: float = 30.0
+    trend_momentum_max: float = 50.0
+    trend_x_min: float = 30.0
+    trend_x_max: float = 50.0
+    score_min: Optional[float] = 10.0
+    score_max: Optional[float] = 50.0
+    overheat_momentum_max: Optional[float] = 60.0
+    require_volume_confirm: bool = True
+    volume_ratio_min: float = 0.9
+    require_score_for_reversal: bool = False
+    trend_require_close_above_ma20: bool = True
+    trend_ma20_slope_min: Optional[float] = 0.0
+    trend_require_close_above_ma60: bool = False
+    trend_ma60_slope_min: Optional[float] = None
+    trend_require_ma20_above_ma60: bool = False
+    trend_low20_distance_min: Optional[float] = None
+
+    def _compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        return compute_kg_momentum(df)
+
+    def _trend_context_mask(self, df: pd.DataFrame) -> pd.Series:
+        close = df["close"].astype(float)
+        mask = pd.Series(True, index=df.index)
+        if self.trend_require_close_above_ma20:
+            mask &= close > df["kg_ma20"].astype(float)
+        if self.trend_require_close_above_ma60:
+            mask &= close > df["kg_ma60"].astype(float)
+        if self.trend_require_ma20_above_ma60:
+            mask &= df["kg_ma20"].astype(float) > df["kg_ma60"].astype(float)
+        if self.trend_ma20_slope_min is not None:
+            mask &= df["kg_ma20_slope5"].astype(float) >= self.trend_ma20_slope_min
+        if self.trend_ma60_slope_min is not None:
+            mask &= df["kg_ma60_slope5"].astype(float) >= self.trend_ma60_slope_min
+        if self.trend_low20_distance_min is not None:
+            mask &= df["kg_low20_distance"].astype(float) >= self.trend_low20_distance_min
+        return mask.fillna(False)
+
+    def _mode_mask(self, df: pd.DataFrame) -> pd.Series:
+        momentum = df["kg_momentum"].astype(float)
+        x_momentum = df["kg_x_momentum"].astype(float)
+        score = df["kg_score"].astype(float)
+
+        reversal = (momentum < self.reversal_momentum_max) & (x_momentum >= self.reversal_x_min)
+        if self.require_score_for_reversal:
+            if self.score_min is not None:
+                reversal &= score >= self.score_min
+            if self.score_max is not None:
+                reversal &= score <= self.score_max
+
+        momentum_rebound = (
+            momentum.between(self.trend_momentum_min, self.trend_momentum_max)
+            & x_momentum.between(self.trend_x_min, self.trend_x_max)
+        )
+        if self.score_min is not None:
+            momentum_rebound &= score >= self.score_min
+        if self.score_max is not None:
+            momentum_rebound &= score <= self.score_max
+
+        trend = momentum_rebound & self._trend_context_mask(df)
+
+        mode = self.mode.lower()
+        if mode == "reversal":
+            mask = reversal
+        elif mode in {"momentum_rebound", "rebound", "left_to_right_early"}:
+            mask = momentum_rebound
+        elif mode in {"trend", "trend_continue", "continuation"}:
+            mask = trend
+        elif mode == "both":
+            mask = reversal | trend
+        else:
+            raise ValueError(f"Unsupported KG momentum mode: {self.mode}")
+
+        if self.overheat_momentum_max is not None:
+            mask &= momentum <= self.overheat_momentum_max
+        if self.require_volume_confirm:
+            mask &= df["kg_vol_ratio"].astype(float) >= self.volume_ratio_min
+        return mask.fillna(False)
+
+    def __call__(self, hist: pd.DataFrame) -> bool:
+        if hist.empty:
+            return False
+        if "kg_pick" not in hist.columns:
+            hist = self._compute(hist)
+        return bool(self._mode_mask(hist).iloc[-1])
+
+    def vec_mask(self, df: pd.DataFrame) -> np.ndarray:
+        if "kg_pick" not in df.columns:
+            df = self._compute(df)
+        return self._mode_mask(df).to_numpy(dtype=bool)
+
+
 # =============================================================================
 # ── 具体 Selector 实现 ────────────────────────────────────────────────────────
 # =============================================================================
@@ -931,6 +1335,147 @@ class BrickChartSelector(PipelineSelector):
             val = float(hist["brick_growth"].iloc[-1])
             return val if np.isfinite(val) else -np.inf
         return float(self._pattern_filter.brick_growth_arr(hist)[-1])
+
+
+class GoldenNeedleSelector(PipelineSelector):
+    """黄金针选股器：完全复刻通达信 COND1-6，并保留中间指标列。"""
+
+    def __init__(
+        self,
+        *,
+        n1: int = 3,
+        n2: int = 21,
+        include_platinum: bool = True,
+        cond1_long_min: float = 79.0,
+        cond1_short_max: float = 30.0,
+        cond2_gap_min: float = 58.0,
+        cond2_long_min: float = 70.0,
+        cond6_count_window: int = 8,
+        cond6_count_min: int = 4,
+        cond6_count_short_max: float = 75.0,
+        cond6_long_window: int = 9,
+        cond6_long_min: float = 85.0,
+        cond6_short_max: float = 60.0,
+        date_col: str = "date",
+        extra_bars_buffer: int = 0,
+    ) -> None:
+        self.n1 = int(n1)
+        self.n2 = int(n2)
+        self.include_platinum = bool(include_platinum)
+        self.cond1_long_min = float(cond1_long_min)
+        self.cond1_short_max = float(cond1_short_max)
+        self.cond2_gap_min = float(cond2_gap_min)
+        self.cond2_long_min = float(cond2_long_min)
+        self.cond6_count_window = int(cond6_count_window)
+        self.cond6_count_min = int(cond6_count_min)
+        self.cond6_count_short_max = float(cond6_count_short_max)
+        self.cond6_long_window = int(cond6_long_window)
+        self.cond6_long_min = float(cond6_long_min)
+        self.cond6_short_max = float(cond6_short_max)
+        self._pattern_filter = GoldenNeedlePatternFilter(
+            include_platinum=self.include_platinum,
+            n1=self.n1,
+            n2=self.n2,
+            cond1_long_min=self.cond1_long_min,
+            cond1_short_max=self.cond1_short_max,
+            cond2_gap_min=self.cond2_gap_min,
+            cond2_long_min=self.cond2_long_min,
+            cond6_count_window=self.cond6_count_window,
+            cond6_count_min=self.cond6_count_min,
+            cond6_count_short_max=self.cond6_count_short_max,
+            cond6_long_window=self.cond6_long_window,
+            cond6_long_min=self.cond6_long_min,
+            cond6_short_max=self.cond6_short_max,
+        )
+
+        super().__init__(
+            [self._pattern_filter],
+            date_col=date_col,
+            min_bars=max(self.n1, self.n2 + self.cond6_long_window - 1, 6) + 1,
+            extra_bars_buffer=extra_bars_buffer,
+        )
+
+    def prepare_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = compute_golden_needle(
+            df,
+            n1=self.n1,
+            n2=self.n2,
+            cond1_long_min=self.cond1_long_min,
+            cond1_short_max=self.cond1_short_max,
+            cond2_gap_min=self.cond2_gap_min,
+            cond2_long_min=self.cond2_long_min,
+            cond6_count_window=self.cond6_count_window,
+            cond6_count_min=self.cond6_count_min,
+            cond6_count_short_max=self.cond6_count_short_max,
+            cond6_long_window=self.cond6_long_window,
+            cond6_long_min=self.cond6_long_min,
+            cond6_short_max=self.cond6_short_max,
+        )
+        df["_vec_pick"] = self._pattern_filter.vec_mask(df)
+        return df
+
+
+class KGMomentumSelector(PipelineSelector):
+    """KG/JRX 动能选股器：识别洗盘反转与健康回调后的趋势延续。"""
+
+    def __init__(
+        self,
+        *,
+        mode: str = "both",
+        reversal_momentum_max: float = 20.0,
+        reversal_x_min: float = 50.0,
+        trend_momentum_min: float = 30.0,
+        trend_momentum_max: float = 50.0,
+        trend_x_min: float = 30.0,
+        trend_x_max: float = 50.0,
+        score_min: Optional[float] = 10.0,
+        score_max: Optional[float] = 50.0,
+        overheat_momentum_max: Optional[float] = 60.0,
+        require_volume_confirm: bool = True,
+        volume_ratio_min: float = 0.9,
+        require_score_for_reversal: bool = False,
+        trend_require_close_above_ma20: bool = True,
+        trend_ma20_slope_min: Optional[float] = 0.0,
+        trend_require_close_above_ma60: bool = False,
+        trend_ma60_slope_min: Optional[float] = None,
+        trend_require_ma20_above_ma60: bool = False,
+        trend_low20_distance_min: Optional[float] = None,
+        date_col: str = "date",
+        extra_bars_buffer: int = 0,
+    ) -> None:
+        self.mode = mode
+        self._pattern_filter = KGMomentumPatternFilter(
+            mode=mode,
+            reversal_momentum_max=float(reversal_momentum_max),
+            reversal_x_min=float(reversal_x_min),
+            trend_momentum_min=float(trend_momentum_min),
+            trend_momentum_max=float(trend_momentum_max),
+            trend_x_min=float(trend_x_min),
+            trend_x_max=float(trend_x_max),
+            score_min=None if score_min is None else float(score_min),
+            score_max=None if score_max is None else float(score_max),
+            overheat_momentum_max=None if overheat_momentum_max is None else float(overheat_momentum_max),
+            require_volume_confirm=bool(require_volume_confirm),
+            volume_ratio_min=float(volume_ratio_min),
+            require_score_for_reversal=bool(require_score_for_reversal),
+            trend_require_close_above_ma20=bool(trend_require_close_above_ma20),
+            trend_ma20_slope_min=None if trend_ma20_slope_min is None else float(trend_ma20_slope_min),
+            trend_require_close_above_ma60=bool(trend_require_close_above_ma60),
+            trend_ma60_slope_min=None if trend_ma60_slope_min is None else float(trend_ma60_slope_min),
+            trend_require_ma20_above_ma60=bool(trend_require_ma20_above_ma60),
+            trend_low20_distance_min=None if trend_low20_distance_min is None else float(trend_low20_distance_min),
+        )
+        super().__init__(
+            [self._pattern_filter],
+            date_col=date_col,
+            min_bars=65,
+            extra_bars_buffer=extra_bars_buffer,
+        )
+
+    def prepare_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = compute_kg_momentum(df)
+        df["_vec_pick"] = self._pattern_filter.vec_mask(df)
+        return df
 
 
 # =============================================================================

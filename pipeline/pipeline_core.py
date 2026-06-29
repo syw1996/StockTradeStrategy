@@ -63,8 +63,18 @@ def _prepare_worker(args: tuple) -> tuple[str, Optional[pd.DataFrame]]:
     for col in ("open", "close", "volume"):
         if col not in df.columns:
             return code, None
-    o, c, v = df["open"], df["close"], df["volume"]
-    df["signed_turnover"] = (o + c) / 2 * v
+    o = pd.to_numeric(df["open"], errors="coerce")
+    c = pd.to_numeric(df["close"], errors="coerce")
+    v = pd.to_numeric(df["volume"], errors="coerce")
+    estimated_turnover = (o + c) / 2 * v
+    if "amount" in df.columns:
+        amount = pd.to_numeric(df["amount"], errors="coerce")
+        if amount.notna().any():
+            df["signed_turnover"] = amount.where(amount.notna(), estimated_turnover)
+        else:
+            df["signed_turnover"] = estimated_turnover
+    else:
+        df["signed_turnover"] = estimated_turnover
     df["turnover_n"] = df["signed_turnover"].rolling(n_turnover_days, min_periods=1).sum()
 
     # set index

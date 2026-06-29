@@ -42,6 +42,8 @@
 }
 .strategy-brick { background: #d4f5e2; color: #1a7f37; }
 .strategy-b1    { background: #daeeff; color: #0969da; }
+.strategy-golden_needle { background: #fff0c2; color: #9a6700; }
+.strategy-kg_momentum   { background: #ffe2e0; color: #c93c37; }
 
 .candidate-meta {
     font-size: 0.82rem;

@@ -3,7 +3,7 @@
 一个面向 A 股的半自动选股项目：
 
 - 使用 Tushare 拉取股票日线数据
-- 用量化规则做初选（目前只实现了B1选股）
+- 用量化规则做初选（B1、砖型图、黄金针/白金针、KG 动能）
 - 导出候选股票 K 线图
 - 调用 Gemini 对图表进行 AI 复评打分
 
@@ -13,7 +13,7 @@
 
 - 推翻了旧版选股模式（各式各样的B1太麻烦了）
 - 新加入了AI看图打分精选功能（是的，不用再自己看图了）
-- 目前只支持B1选股，后续Z哥讲了砖型图10张图后，会更新砖型图精选
+- 已支持 B1、砖型图、黄金针/白金针、KG 动能等初选策略
 
 ---
 
@@ -165,7 +165,7 @@ python agent/gemini_review.py --config config/gemini_review.yaml
 ### 6.2 初选层
 
 - top_m 决定流动性股票池大小
-- b1.enabled、brick.enabled 控制策略开关
+- b1.enabled、brick.enabled、golden_needle.enabled、kg_momentum.enabled 控制策略开关
 - 可先只开一个策略做回放验证
 
 ### 6.3 复评层
@@ -218,7 +218,7 @@ data/review/日期/suggestion.json
 ### Q4：没有候选股票
 
 - 检查 data/raw 是否有最新数据
-- 放宽初选阈值（如 B1 或 Brick 参数）
+- 放宽初选阈值（如 B1、Brick、GoldenNeedle 或 KGMomentum 参数）
 - 检查 pick_date 是否在有效交易日
 
 ---

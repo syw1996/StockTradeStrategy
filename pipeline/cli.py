@@ -93,11 +93,20 @@ def cmd_preselect(args: argparse.Namespace) -> None:
 
     # 终端摘要
     if candidates:
-        print(f"\n{'代码':>8}  {'策略':>6}  {'收盘价':>8}  {'砖型增长':>10}")
-        print("-" * 44)
+        print(f"\n{'代码':>8}  {'策略':>18}  {'收盘价':>8}  {'砖型增长':>10}  {'信号':>16}")
+        print("-" * 74)
         for c in candidates:
             bg = f"{c.brick_growth:.2f}x" if c.brick_growth is not None else "  —"
-            print(f"{c.code:>8}  {c.strategy:>6}  {c.close:>8.2f}  {bg:>10}")
+            signal = ""
+            if c.extra:
+                signal = str(
+                    c.extra.get("needle_signal")
+                    or c.extra.get("golden_needle_extra", {}).get("needle_signal")
+                    or c.extra.get("kg_signal")
+                    or c.extra.get("kg_momentum_extra", {}).get("kg_signal")
+                    or ""
+                )
+            print(f"{c.code:>8}  {c.strategy:>18}  {c.close:>8.2f}  {bg:>10}  {signal:>16}")
     else:
         print("\n(今日无候选股票)")
 
