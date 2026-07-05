@@ -102,6 +102,8 @@ def cmd_preselect(args: argparse.Namespace) -> None:
                 signal = str(
                     c.extra.get("needle_signal")
                     or c.extra.get("golden_needle_extra", {}).get("needle_signal")
+                    or c.extra.get("divergence_signal")
+                    or c.extra.get("divergence_buy_extra", {}).get("divergence_signal")
                     or c.extra.get("kg_signal")
                     or c.extra.get("kg_momentum_extra", {}).get("kg_signal")
                     or ""

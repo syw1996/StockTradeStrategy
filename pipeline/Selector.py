@@ -500,6 +500,140 @@ def compute_kg_momentum(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def compute_divergence_buy(
+    df: pd.DataFrame,
+    *,
+    n1: int = 3,
+    n2: int = 21,
+    boll_window: int = 20,
+    high_period: int = 60,
+    single_pin_short_max: float = 50.0,
+    single_pin_long_min: float = 60.0,
+    daily_change_min: float = -9.0,
+    daily_change_max: float = -2.0,
+    touch_boll_window: int = 8,
+    star_entity_max: float = 0.02,
+    near_high_low: float = 0.88,
+    near_high_high: float = 1.12,
+    volume_shrink_ratio: float = 1.2,
+    require_volume_shrink_in_a: bool = False,
+    boll_width_lookback: int = 60,
+    boll_width_ratio: float = 0.65,
+    midline_tolerance: float = 0.98,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
+    macd_close_dea_max: float = 0.05,
+    right_ma_short: int = 20,
+    right_ma_long: int = 60,
+    right_ma_slope_window: int = 5,
+    right_ma_slope_min: float = 0.0,
+) -> pd.DataFrame:
+    """Vectorized upgraded divergence buy point with A required for the pick."""
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    close = out["close"].astype(float)
+    open_ = out["open"].astype(float)
+    high = out["high"].astype(float)
+    low = out["low"].astype(float)
+    volume = out["volume"].astype(float)
+
+    prev_close = close.shift(1)
+
+    llv1 = low.rolling(n1, min_periods=n1).min()
+    hhv1 = close.rolling(n1, min_periods=n1).max()
+    llv2 = low.rolling(n2, min_periods=n2).min()
+    hhv2 = close.rolling(n2, min_periods=n2).max()
+    short_pos = 100.0 * (close - llv1) / (hhv1 - llv1 + 0.0001)
+    long_pos = 100.0 * (close - llv2) / (hhv2 - llv2 + 0.0001)
+    single_pin = (short_pos <= single_pin_short_max) & (long_pos >= single_pin_long_min)
+
+    volume_shrink = volume < volume.shift(1) * volume_shrink_ratio
+    a_base = single_pin & (volume_shrink if require_volume_shrink_in_a else True)
+
+    daily_change = ((close - prev_close) / prev_close.replace(0, np.nan) * 100.0).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+    cond1 = daily_change.between(daily_change_min, daily_change_max) & a_base
+
+    boll_mid = close.rolling(boll_window, min_periods=boll_window).mean()
+    boll_std = close.rolling(boll_window, min_periods=boll_window).std(ddof=0)
+    boll_up = boll_mid + 2.0 * boll_std
+    boll_dn = boll_mid - 2.0 * boll_std
+    touch_boll_up = (high >= boll_up).astype(int).rolling(
+        touch_boll_window,
+        min_periods=touch_boll_window,
+    ).sum() >= 1
+
+    star_entity = (close - open_).abs() / prev_close.replace(0, np.nan) < star_entity_max
+    upper_shadow = (high - pd.concat([close, open_], axis=1).max(axis=1)) > (
+        pd.concat([close, open_], axis=1).min(axis=1) - low
+    )
+    yin_star = close < open_
+    cross_yin_star = star_entity & upper_shadow & yin_star
+
+    high_high = high.rolling(high_period, min_periods=high_period).max()
+    near_high = close.between(high_high * near_high_low, high_high * near_high_high)
+    cond2 = touch_boll_up & cross_yin_star & near_high & a_base
+    a_class = cond1 | cond2
+
+    boll_width = boll_up - boll_dn
+    width_small = boll_width <= (
+        boll_width.rolling(boll_width_lookback, min_periods=boll_width_lookback).max()
+        * boll_width_ratio
+    )
+    no_break_mid = close >= boll_mid * midline_tolerance
+    b_class = width_small & no_break_mid
+
+    dif = close.ewm(span=macd_fast, adjust=False).mean() - close.ewm(span=macd_slow, adjust=False).mean()
+    dea = dif.ewm(span=macd_signal, adjust=False).mean()
+    macd_water = (dif > 0) & (dea > 0)
+    dif_up = (dif > dif.shift(1)) | (dif > dif.shift(2))
+    close_dea = (dif - dea).abs() < macd_close_dea_max
+    c_class = macd_water & dif_up & close_dea
+
+    right_ma_short_ser = close.rolling(right_ma_short, min_periods=right_ma_short).mean()
+    right_ma_long_ser = close.rolling(right_ma_long, min_periods=right_ma_long).mean()
+    right_ma_slope = right_ma_short_ser / right_ma_short_ser.shift(right_ma_slope_window) - 1.0
+    right_close_gt_short = close > right_ma_short_ser
+    right_short_ge_long = right_ma_short_ser >= right_ma_long_ser
+    right_slope_ok = right_ma_slope >= right_ma_slope_min
+    right_side = right_close_gt_short & right_short_ge_long & right_slope_ok
+
+    out["divergence_short_pos"] = short_pos
+    out["divergence_long_pos"] = long_pos
+    out["divergence_daily_change"] = daily_change
+    out["divergence_volume_shrink"] = volume_shrink.fillna(False)
+    out["divergence_boll_mid"] = boll_mid
+    out["divergence_boll_up"] = boll_up
+    out["divergence_boll_dn"] = boll_dn
+    out["divergence_boll_width"] = boll_width
+    out["divergence_dif"] = dif
+    out["divergence_dea"] = dea
+    out["divergence_c1"] = cond1.fillna(False)
+    out["divergence_c2"] = cond2.fillna(False)
+    out["divergence_a"] = a_class.fillna(False)
+    out["divergence_b"] = b_class.fillna(False)
+    out["divergence_c"] = c_class.fillna(False)
+    out["divergence_right_ma_short"] = right_ma_short_ser
+    out["divergence_right_ma_long"] = right_ma_long_ser
+    out["divergence_right_ma_slope"] = right_ma_slope
+    out["divergence_right_close_gt_short"] = right_close_gt_short.fillna(False)
+    out["divergence_right_short_ge_long"] = right_short_ge_long.fillna(False)
+    out["divergence_right_slope_ok"] = right_slope_ok.fillna(False)
+    out["divergence_right_side"] = right_side.fillna(False)
+    out["divergence_confirmed"] = out["divergence_a"] & (out["divergence_b"] | out["divergence_c"])
+    out["divergence_upgraded_b2"] = (
+        (out["divergence_a"] & out["divergence_b"])
+        | (out["divergence_a"] & out["divergence_c"])
+        | (out["divergence_b"] & out["divergence_c"])
+    )
+    return out
+
+
 # =============================================================================
 # Protocol / 基类
 # =============================================================================
@@ -1076,6 +1210,97 @@ class KGMomentumPatternFilter:
         return self._mode_mask(df).to_numpy(dtype=bool)
 
 
+@dataclass(frozen=True)
+class DivergenceBuyPatternFilter:
+    """Upgraded divergence buy filter.
+
+    Default mode keeps A-class divergence mandatory: A AND (B OR C).
+    """
+    mode: str = "confirmed"
+    n1: int = 3
+    n2: int = 21
+    boll_window: int = 20
+    high_period: int = 60
+    single_pin_short_max: float = 50.0
+    single_pin_long_min: float = 60.0
+    daily_change_min: float = -9.0
+    daily_change_max: float = -2.0
+    touch_boll_window: int = 8
+    star_entity_max: float = 0.02
+    near_high_low: float = 0.88
+    near_high_high: float = 1.12
+    volume_shrink_ratio: float = 1.2
+    require_volume_shrink_in_a: bool = False
+    boll_width_lookback: int = 60
+    boll_width_ratio: float = 0.65
+    midline_tolerance: float = 0.98
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    macd_close_dea_max: float = 0.05
+    right_side_enabled: bool = False
+    right_ma_short: int = 20
+    right_ma_long: int = 60
+    right_ma_slope_window: int = 5
+    right_ma_slope_min: float = 0.0
+
+    def _compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        return compute_divergence_buy(
+            df,
+            n1=self.n1,
+            n2=self.n2,
+            boll_window=self.boll_window,
+            high_period=self.high_period,
+            single_pin_short_max=self.single_pin_short_max,
+            single_pin_long_min=self.single_pin_long_min,
+            daily_change_min=self.daily_change_min,
+            daily_change_max=self.daily_change_max,
+            touch_boll_window=self.touch_boll_window,
+            star_entity_max=self.star_entity_max,
+            near_high_low=self.near_high_low,
+            near_high_high=self.near_high_high,
+            volume_shrink_ratio=self.volume_shrink_ratio,
+            require_volume_shrink_in_a=self.require_volume_shrink_in_a,
+            boll_width_lookback=self.boll_width_lookback,
+            boll_width_ratio=self.boll_width_ratio,
+            midline_tolerance=self.midline_tolerance,
+            macd_fast=self.macd_fast,
+            macd_slow=self.macd_slow,
+            macd_signal=self.macd_signal,
+            macd_close_dea_max=self.macd_close_dea_max,
+            right_ma_short=self.right_ma_short,
+            right_ma_long=self.right_ma_long,
+            right_ma_slope_window=self.right_ma_slope_window,
+            right_ma_slope_min=self.right_ma_slope_min,
+        )
+
+    def _mode_mask(self, df: pd.DataFrame) -> pd.Series:
+        mode = self.mode.lower()
+        if mode in {"confirmed", "divergence_confirmed", "a_confirmed"}:
+            mask = df["divergence_confirmed"]
+        elif mode in {"a", "a_only", "observation"}:
+            mask = df["divergence_a"]
+        elif mode in {"upgraded_b2", "b2"}:
+            mask = df["divergence_upgraded_b2"]
+        else:
+            raise ValueError(f"Unsupported divergence buy mode: {self.mode}")
+        if self.right_side_enabled:
+            mask &= df["divergence_right_side"]
+        return mask.fillna(False)
+
+    def __call__(self, hist: pd.DataFrame) -> bool:
+        if hist.empty:
+            return False
+        if "divergence_confirmed" not in hist.columns:
+            hist = self._compute(hist)
+        return bool(self._mode_mask(hist).iloc[-1])
+
+    def vec_mask(self, df: pd.DataFrame) -> np.ndarray:
+        if "divergence_confirmed" not in df.columns:
+            df = self._compute(df)
+        return self._mode_mask(df).to_numpy(dtype=bool)
+
+
 # =============================================================================
 # ── 具体 Selector 实现 ────────────────────────────────────────────────────────
 # =============================================================================
@@ -1411,6 +1636,98 @@ class GoldenNeedleSelector(PipelineSelector):
             cond6_long_min=self.cond6_long_min,
             cond6_short_max=self.cond6_short_max,
         )
+        df["_vec_pick"] = self._pattern_filter.vec_mask(df)
+        return df
+
+
+class DivergenceBuySelector(PipelineSelector):
+    """Upgraded divergence buy selector.
+
+    The default pick is A-class divergence confirmed by either B-class Boll
+    compression or C-class MACD proximity.
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: str = "confirmed",
+        n1: int = 3,
+        n2: int = 21,
+        boll_window: int = 20,
+        high_period: int = 60,
+        single_pin_short_max: float = 50.0,
+        single_pin_long_min: float = 60.0,
+        daily_change_min: float = -9.0,
+        daily_change_max: float = -2.0,
+        touch_boll_window: int = 8,
+        star_entity_max: float = 0.02,
+        near_high_low: float = 0.88,
+        near_high_high: float = 1.12,
+        volume_shrink_ratio: float = 1.2,
+        require_volume_shrink_in_a: bool = False,
+        boll_width_lookback: int = 60,
+        boll_width_ratio: float = 0.65,
+        midline_tolerance: float = 0.98,
+        macd_fast: int = 12,
+        macd_slow: int = 26,
+        macd_signal: int = 9,
+        macd_close_dea_max: float = 0.05,
+        right_side_enabled: bool = False,
+        right_ma_short: int = 20,
+        right_ma_long: int = 60,
+        right_ma_slope_window: int = 5,
+        right_ma_slope_min: float = 0.0,
+        date_col: str = "date",
+        extra_bars_buffer: int = 0,
+    ) -> None:
+        self.mode = mode
+        self._pattern_filter = DivergenceBuyPatternFilter(
+            mode=mode,
+            n1=int(n1),
+            n2=int(n2),
+            boll_window=int(boll_window),
+            high_period=int(high_period),
+            single_pin_short_max=float(single_pin_short_max),
+            single_pin_long_min=float(single_pin_long_min),
+            daily_change_min=float(daily_change_min),
+            daily_change_max=float(daily_change_max),
+            touch_boll_window=int(touch_boll_window),
+            star_entity_max=float(star_entity_max),
+            near_high_low=float(near_high_low),
+            near_high_high=float(near_high_high),
+            volume_shrink_ratio=float(volume_shrink_ratio),
+            require_volume_shrink_in_a=bool(require_volume_shrink_in_a),
+            boll_width_lookback=int(boll_width_lookback),
+            boll_width_ratio=float(boll_width_ratio),
+            midline_tolerance=float(midline_tolerance),
+            macd_fast=int(macd_fast),
+            macd_slow=int(macd_slow),
+            macd_signal=int(macd_signal),
+            macd_close_dea_max=float(macd_close_dea_max),
+            right_side_enabled=bool(right_side_enabled),
+            right_ma_short=int(right_ma_short),
+            right_ma_long=int(right_ma_long),
+            right_ma_slope_window=int(right_ma_slope_window),
+            right_ma_slope_min=float(right_ma_slope_min),
+        )
+        min_bars = max(
+            int(n2),
+            int(boll_window) + int(boll_width_lookback) - 1,
+            int(high_period),
+            int(touch_boll_window),
+            int(macd_slow) + int(macd_signal),
+            int(right_ma_long),
+            int(right_ma_short) + int(right_ma_slope_window),
+        )
+        super().__init__(
+            [self._pattern_filter],
+            date_col=date_col,
+            min_bars=min_bars,
+            extra_bars_buffer=extra_bars_buffer,
+        )
+
+    def prepare_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = self._pattern_filter._compute(df)
         df["_vec_pick"] = self._pattern_filter.vec_mask(df)
         return df
 

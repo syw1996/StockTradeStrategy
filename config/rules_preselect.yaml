@@ -83,6 +83,39 @@ golden_needle:
   cond6_long_min: 85
   cond6_short_max: 60
 
+divergence_buy:
+  enabled: true
+  # confirmed = A类分歧 AND (B类布林缩口守中轨 OR C类MACD水上靠近)
+  # a_only = 只看A类分歧观察池
+  # upgraded_b2 = 原升级版任意两类共振口径
+  mode: "confirmed"
+  n1: 3
+  n2: 21
+  boll_window: 20
+  high_period: 60
+  single_pin_short_max: 50
+  single_pin_long_min: 60
+  daily_change_min: -9
+  daily_change_max: -2
+  touch_boll_window: 8
+  star_entity_max: 0.02
+  near_high_low: 0.88
+  near_high_high: 1.12
+  volume_shrink_ratio: 1.2
+  require_volume_shrink_in_a: false
+  boll_width_lookback: 60
+  boll_width_ratio: 0.65
+  midline_tolerance: 0.98
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  macd_close_dea_max: 0.05
+  right_side_filter:
+    enabled: false
+    ma_short: 20
+    ma_long: 60
+    ma_slope_window: 5
+    ma_slope_min: 0.0
 
 kg_momentum:
   enabled: false

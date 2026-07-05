@@ -25,6 +25,7 @@ from schemas import Candidate
 from Selector import (
     B1Selector,
     BrickChartSelector,
+    DivergenceBuySelector,
     GoldenNeedleSelector,
     KGMomentumSelector,
 )
@@ -169,6 +170,29 @@ def _calc_warmup(cfg: dict, buffer: int) -> int:
             + buffer,
         )
 
+    cfg_divergence = cfg.get("divergence_buy", {})
+    if cfg_divergence.get("enabled", False):
+        right_cfg = cfg_divergence.get("right_side_filter", {}) or {}
+        warmup = max(
+            warmup,
+            int(cfg_divergence.get("n2", 21)) + buffer,
+            int(cfg_divergence.get("boll_window", 20))
+            + int(cfg_divergence.get("boll_width_lookback", 60))
+            - 1
+            + buffer,
+            int(cfg_divergence.get("high_period", 60)) + buffer,
+            int(cfg_divergence.get("macd_slow", 26))
+            + int(cfg_divergence.get("macd_signal", 9))
+            + buffer,
+        )
+        if bool(right_cfg.get("enabled", cfg_divergence.get("right_side_enabled", False))):
+            warmup = max(
+                warmup,
+                int(right_cfg.get("ma_long", 60)) + buffer,
+                int(right_cfg.get("ma_short", 20))
+                + int(right_cfg.get("ma_slope_window", 5))
+                + buffer,
+            )
 
     cfg_kg_momentum = cfg.get("kg_momentum", {})
     if cfg_kg_momentum.get("enabled", False):
@@ -579,7 +603,7 @@ def run_institutional_1(
 def _legacy_strategies_enabled(cfg: dict) -> bool:
     return any(
         bool(cfg.get(name, {}).get("enabled", False))
-        for name in ("b1", "brick", "golden_needle", "kg_momentum")
+        for name in ("b1", "brick", "golden_needle", "divergence_buy", "kg_momentum")
     )
 
 
@@ -817,6 +841,105 @@ def _round_float(value: object, ndigits: int = 2) -> Optional[float]:
         return None
     return round(val, ndigits)
 
+
+def _divergence_signal_type(row: pd.Series) -> str:
+    parts = []
+    if bool(row.get("divergence_a", False)):
+        parts.append("A")
+    if bool(row.get("divergence_b", False)):
+        parts.append("B")
+    if bool(row.get("divergence_c", False)):
+        parts.append("C")
+    return "+".join(parts)
+
+
+def _divergence_triggered_conditions(row: pd.Series) -> List[str]:
+    return [name for name in ("C1", "C2") if bool(row.get(f"divergence_{name.lower()}", False))]
+
+
+def run_divergence_buy(
+    prepared: Dict[str, pd.DataFrame],
+    pick_date: pd.Timestamp,
+    pool_codes: List[str],
+    cfg_divergence: dict,
+) -> List[Candidate]:
+    """Run the upgraded divergence buy strategy."""
+    right_cfg = cfg_divergence.get("right_side_filter", {}) or {}
+    right_side_enabled = bool(right_cfg.get("enabled", cfg_divergence.get("right_side_enabled", False)))
+    selector = DivergenceBuySelector(
+        mode=str(cfg_divergence.get("mode", "confirmed")),
+        n1=int(cfg_divergence.get("n1", 3)),
+        n2=int(cfg_divergence.get("n2", 21)),
+        boll_window=int(cfg_divergence.get("boll_window", 20)),
+        high_period=int(cfg_divergence.get("high_period", 60)),
+        single_pin_short_max=float(cfg_divergence.get("single_pin_short_max", 50.0)),
+        single_pin_long_min=float(cfg_divergence.get("single_pin_long_min", 60.0)),
+        daily_change_min=float(cfg_divergence.get("daily_change_min", -9.0)),
+        daily_change_max=float(cfg_divergence.get("daily_change_max", -2.0)),
+        touch_boll_window=int(cfg_divergence.get("touch_boll_window", 8)),
+        star_entity_max=float(cfg_divergence.get("star_entity_max", 0.02)),
+        near_high_low=float(cfg_divergence.get("near_high_low", 0.88)),
+        near_high_high=float(cfg_divergence.get("near_high_high", 1.12)),
+        volume_shrink_ratio=float(cfg_divergence.get("volume_shrink_ratio", 1.2)),
+        require_volume_shrink_in_a=bool(cfg_divergence.get("require_volume_shrink_in_a", False)),
+        boll_width_lookback=int(cfg_divergence.get("boll_width_lookback", 60)),
+        boll_width_ratio=float(cfg_divergence.get("boll_width_ratio", 0.65)),
+        midline_tolerance=float(cfg_divergence.get("midline_tolerance", 0.98)),
+        macd_fast=int(cfg_divergence.get("macd_fast", 12)),
+        macd_slow=int(cfg_divergence.get("macd_slow", 26)),
+        macd_signal=int(cfg_divergence.get("macd_signal", 9)),
+        macd_close_dea_max=float(cfg_divergence.get("macd_close_dea_max", 0.05)),
+        right_side_enabled=right_side_enabled,
+        right_ma_short=int(right_cfg.get("ma_short", 20)),
+        right_ma_long=int(right_cfg.get("ma_long", 60)),
+        right_ma_slope_window=int(right_cfg.get("ma_slope_window", 5)),
+        right_ma_slope_min=float(right_cfg.get("ma_slope_min", 0.0)),
+    )
+
+    date_str = pick_date.strftime("%Y-%m-%d")
+    candidates: List[Candidate] = []
+
+    for code in pool_codes:
+        df = prepared.get(code)
+        if df is None or pick_date not in df.index:
+            continue
+        try:
+            pf = selector.prepare_df(df)
+            if selector.vec_picks_from_prepared(pf, start=pick_date, end=pick_date):
+                row = pf.loc[pick_date]
+                candidates.append(Candidate(
+                    code=code,
+                    date=date_str,
+                    strategy="divergence_buy",
+                    close=float(row["close"]),
+                    turnover_n=float(row["turnover_n"]),
+                    extra={
+                        "divergence_signal": _divergence_signal_type(row),
+                        "divergence_conditions": _divergence_triggered_conditions(row),
+                        "divergence_short_pos": _round_float(row.get("divergence_short_pos")),
+                        "divergence_long_pos": _round_float(row.get("divergence_long_pos")),
+                        "divergence_daily_change": _round_float(row.get("divergence_daily_change")),
+                        "divergence_boll_width": _round_float(row.get("divergence_boll_width"), 4),
+                        "divergence_dif": _round_float(row.get("divergence_dif"), 4),
+                        "divergence_dea": _round_float(row.get("divergence_dea"), 4),
+                        "divergence_a": bool(row.get("divergence_a", False)),
+                        "divergence_b": bool(row.get("divergence_b", False)),
+                        "divergence_c": bool(row.get("divergence_c", False)),
+                        "right_side_enabled": right_side_enabled,
+                        "right_side": bool(row.get("divergence_right_side", False)),
+                        "right_ma_short": _round_float(row.get("divergence_right_ma_short"), 4),
+                        "right_ma_long": _round_float(row.get("divergence_right_ma_long"), 4),
+                        "right_ma_slope": _round_float(row.get("divergence_right_ma_slope"), 6),
+                        "right_close_gt_short": bool(row.get("divergence_right_close_gt_short", False)),
+                        "right_short_ge_long": bool(row.get("divergence_right_short_ge_long", False)),
+                        "right_slope_ok": bool(row.get("divergence_right_slope_ok", False)),
+                    },
+                ))
+        except Exception as exc:
+            logger.debug("Divergence buy skip %s: %s", code, exc)
+
+    logger.info("DivergenceBuy selected: %d", len(candidates))
+    return candidates
 
 
 def _kg_signal_type(row: pd.Series, cfg_kg: dict) -> str:
@@ -1080,6 +1203,13 @@ def run_preselect(
             cfg.get("golden_needle", {}),
         ))
 
+    if cfg.get("divergence_buy", {}).get("enabled", False):
+        all_candidates.extend(run_divergence_buy(
+            prepared,
+            pick_ts,
+            pool_codes,
+            cfg.get("divergence_buy", {}),
+        ))
 
     if cfg.get("kg_momentum", {}).get("enabled", False):
         all_candidates.extend(run_kg_momentum(
