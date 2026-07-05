@@ -22,7 +22,12 @@ import pandas as pd
 import yaml 
 
 from schemas import Candidate
-from Selector import B1Selector, BrickChartSelector, GoldenNeedleSelector, KGMomentumSelector
+from Selector import (
+    B1Selector,
+    BrickChartSelector,
+    GoldenNeedleSelector,
+    KGMomentumSelector,
+)
 from pipeline_core import MarketDataPreparer, TopTurnoverPoolBuilder
 
 logger = logging.getLogger(__name__)
@@ -164,6 +169,7 @@ def _calc_warmup(cfg: dict, buffer: int) -> int:
             + buffer,
         )
 
+
     cfg_kg_momentum = cfg.get("kg_momentum", {})
     if cfg_kg_momentum.get("enabled", False):
         warmup = max(warmup, 65 + buffer)
@@ -204,13 +210,22 @@ def _is_st_name(name: object) -> bool:
 
 
 def _load_st_codes(validation_path: Path) -> set[str]:
-    """从 daily_update_validation 文件加载 ST 股票代码集合."""
+    """从 ST sidecar 文件加载 ST 股票代码集合."""
     if not validation_path.exists():
         raise FileNotFoundError(f"ST 过滤文件不存在: {validation_path}")
     df = pd.read_csv(validation_path, dtype={"symbol": str, "name": str})
-    if "symbol" not in df.columns or "name" not in df.columns:
-        raise ValueError(f"ST 过滤文件缺少 symbol/name 列: {validation_path}")
-    symbols = df.loc[df["name"].map(_is_st_name), "symbol"].dropna().astype(str)
+    if "symbol" not in df.columns:
+        if "ts_code" not in df.columns:
+            raise ValueError(f"ST 过滤文件缺少 symbol 或 ts_code 列: {validation_path}")
+        df["symbol"] = df["ts_code"].astype(str).str.split(".", n=1).str[0]
+
+    if "name" in df.columns:
+        mask = df["name"].map(_is_st_name)
+    else:
+        # Tushare stock_st exports only risk-warning names, so all rows are excluded.
+        mask = pd.Series(True, index=df.index)
+
+    symbols = df.loc[mask, "symbol"].dropna().astype(str)
     return {s.zfill(6) for s in symbols}
 
 
@@ -245,11 +260,181 @@ def _load_min_mv_allowed_codes(market_cap_path: Path, min_total_mv: float) -> se
     return {s.zfill(6) for s in symbols}
 
 
+def _with_symbol(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "symbol" not in out.columns:
+        if "ts_code" not in out.columns:
+            raise ValueError("sidecar data must contain symbol or ts_code")
+        out["symbol"] = out["ts_code"].astype(str).str.split(".", n=1).str[0]
+    out["symbol"] = out["symbol"].astype(str).str.zfill(6)
+    return out
+
+
+def _read_sidecar_csv(
+    sidecar_dir: Path,
+    template: str,
+    pick_date: pd.Timestamp,
+    *,
+    required: bool = True,
+) -> pd.DataFrame:
+    path = _resolve_sidecar_path(
+        _format_filter_source(str(template), pick_date),
+        data_dir=sidecar_dir,
+    )
+    if not path.exists():
+        if required:
+            raise FileNotFoundError(f"sidecar file not found: {path}")
+        return pd.DataFrame()
+    return pd.read_csv(path, dtype={"ts_code": str, "symbol": str})
+
+
+def _sidecar_source_frame(
+    sidecar_dir: Path,
+    pick_date: pd.Timestamp,
+    cfg_inst: dict,
+    key: str,
+    default: str,
+    columns: List[str],
+    *,
+    required: bool = True,
+) -> pd.DataFrame:
+    df = _read_sidecar_csv(
+        sidecar_dir,
+        str(cfg_inst.get(key, default)),
+        pick_date,
+        required=required,
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["symbol", *columns])
+    df = _with_symbol(df)
+    for column in columns:
+        if column not in df.columns:
+            if required:
+                raise ValueError(f"sidecar {key} missing column: {column}")
+            df[column] = pd.NA
+    return df[["symbol", *columns]].drop_duplicates("symbol", keep="last")
+
+
+def _load_moneyflow_ratio_frame(
+    sidecar_dir: Path,
+    pick_date: pd.Timestamp,
+    cfg_inst: dict,
+) -> pd.DataFrame:
+    dc = _sidecar_source_frame(
+        sidecar_dir,
+        pick_date,
+        cfg_inst,
+        "moneyflow_dc_file",
+        "moneyflow_dc/{yyyymmdd}.csv",
+        ["main_net_ratio_pct", "main_net_amount", "net_amount_rate", "net_amount"],
+        required=False,
+    )
+    if not dc.empty:
+        if "main_net_ratio_pct" not in dc.columns or dc["main_net_ratio_pct"].isna().all():
+            dc["main_net_ratio_pct"] = pd.to_numeric(dc.get("net_amount_rate"), errors="coerce")
+        if "main_net_amount" not in dc.columns or dc["main_net_amount"].isna().all():
+            dc["main_net_amount"] = pd.to_numeric(dc.get("net_amount"), errors="coerce")
+        return dc[["symbol", "main_net_ratio_pct", "main_net_amount"]]
+
+    fallback = _sidecar_source_frame(
+        sidecar_dir,
+        pick_date,
+        cfg_inst,
+        "moneyflow_fallback_file",
+        "moneyflow/{yyyymmdd}.csv",
+        ["main_net_ratio_pct", "main_net_amount"],
+        required=True,
+    )
+    return fallback[["symbol", "main_net_ratio_pct", "main_net_amount"]]
+
+
+def _load_institutional_filter_frame(
+    *,
+    pick_date: pd.Timestamp,
+    sidecar_dir: Path,
+    cfg_inst: dict,
+) -> pd.DataFrame:
+    daily_basic = _sidecar_source_frame(
+        sidecar_dir,
+        pick_date,
+        cfg_inst,
+        "daily_basic_file",
+        "daily_basic/{yyyymmdd}.csv",
+        ["total_mv", "circ_mv", "turnover_rate", "close"],
+    ).rename(columns={"close": "basic_close"})
+    daily_market = _sidecar_source_frame(
+        sidecar_dir,
+        pick_date,
+        cfg_inst,
+        "daily_market_file",
+        "daily_market/{yyyymmdd}.csv",
+        ["pct_chg", "amount", "close"],
+    ).rename(columns={"close": "market_close"})
+    financial = _sidecar_source_frame(
+        sidecar_dir,
+        pick_date,
+        cfg_inst,
+        "financial_file",
+        "financial_latest/{yyyymmdd}.csv",
+        ["debt_to_assets", "profit_dedt", "n_cashflow_act"],
+    )
+    limit_up = _sidecar_source_frame(
+        sidecar_dir,
+        pick_date,
+        cfg_inst,
+        "limit_up_ytd_file",
+        "limit_up_ytd/{yyyymmdd}.csv",
+        ["limit_up_days_ytd"],
+    )
+    moneyflow = _load_moneyflow_ratio_frame(sidecar_dir, pick_date, cfg_inst)
+
+    merged = daily_basic.merge(daily_market, on="symbol", how="inner")
+    merged = merged.merge(financial, on="symbol", how="inner")
+    merged = merged.merge(limit_up, on="symbol", how="left")
+    merged = merged.merge(moneyflow, on="symbol", how="inner")
+
+    numeric_cols = [
+        "total_mv",
+        "circ_mv",
+        "turnover_rate",
+        "basic_close",
+        "pct_chg",
+        "amount",
+        "market_close",
+        "debt_to_assets",
+        "profit_dedt",
+        "n_cashflow_act",
+        "limit_up_days_ytd",
+        "main_net_ratio_pct",
+        "main_net_amount",
+    ]
+    for column in numeric_cols:
+        if column in merged.columns:
+            merged[column] = pd.to_numeric(merged[column], errors="coerce")
+
+    merged["amount_10k"] = merged["amount"] / 10.0
+    merged["entry_amount_ratio"] = merged["amount_10k"] / merged["circ_mv"].replace(0, np.nan)
+    merged["strategy1_pass"] = True
+    merged["strategy1_pass"] &= merged["total_mv"] >= float(cfg_inst.get("min_total_mv", 0))
+    merged["strategy1_pass"] &= merged["circ_mv"] >= float(cfg_inst.get("min_circ_mv", 0))
+    merged["strategy1_pass"] &= merged["debt_to_assets"] <= float(cfg_inst.get("max_debt_to_assets", np.inf))
+    merged["strategy1_pass"] &= merged["turnover_rate"] > float(cfg_inst.get("min_turnover_rate", -np.inf))
+    merged["strategy1_pass"] &= merged["pct_chg"] > float(cfg_inst.get("min_pct_chg", -np.inf))
+    merged["strategy1_pass"] &= merged["entry_amount_ratio"] >= float(cfg_inst.get("min_entry_amount_ratio", 0))
+    merged["strategy1_pass"] &= merged["limit_up_days_ytd"].fillna(0) >= float(cfg_inst.get("min_limit_up_days_ytd", 0))
+    if bool(cfg_inst.get("require_oper_cashflow_positive", True)):
+        merged["strategy1_pass"] &= merged["n_cashflow_act"] > 0
+    if bool(cfg_inst.get("require_profit_dedt_positive", True)):
+        merged["strategy1_pass"] &= merged["profit_dedt"] > 0
+    merged["strategy1_pass"] &= merged["main_net_ratio_pct"] >= float(cfg_inst.get("min_main_net_ratio_pct", -np.inf))
+    return merged
+
+
 def _apply_universe_filters(
     pool_codes: List[str],
     *,
     pick_date: pd.Timestamp,
-    data_dir: Path,
+    sidecar_dir: Path,
     cfg: dict,
 ) -> List[str]:
     """按 rules_preselect.yaml 中的 universe_filters 过滤股票池."""
@@ -263,7 +448,7 @@ def _apply_universe_filters(
         template = str(filter_cfg.get("validation_file_template", "daily_update_validation_{yyyymmdd}.csv"))
         validation_path = _resolve_sidecar_path(
             _format_filter_source(template, pick_date),
-            data_dir=data_dir,
+            data_dir=sidecar_dir,
         )
         stocklist_path = Path(__file__).resolve().with_name("stocklist.csv")
         excluded["st"] = _load_st_codes(validation_path) | _load_stocklist_st_codes(stocklist_path)
@@ -273,7 +458,7 @@ def _apply_universe_filters(
         market_cap_file = str(filter_cfg.get("market_cap_file", "largecap.csv"))
         market_cap_path = _resolve_sidecar_path(
             _format_filter_source(market_cap_file, pick_date),
-            data_dir=data_dir,
+            data_dir=sidecar_dir,
         )
         min_mv_allowed = _load_min_mv_allowed_codes(market_cap_path, float(min_total_mv))
         excluded["min_total_mv"] = set(pool_codes) - min_mv_allowed
@@ -328,6 +513,105 @@ def _merge_strategy_candidates(candidates: List[Candidate]) -> List[Candidate]:
 # =============================================================================
 # B1 策略
 # =============================================================================
+
+def run_institutional_1(
+    prepared: Dict[str, pd.DataFrame],
+    pick_date: pd.Timestamp,
+    pool_codes: List[str],
+    sidecar_dir: Path,
+    cfg_inst: dict,
+) -> List[Candidate]:
+    metrics = _load_institutional_filter_frame(
+        pick_date=pick_date,
+        sidecar_dir=sidecar_dir,
+        cfg_inst=cfg_inst,
+    )
+    pool_set = set(pool_codes)
+    passed = metrics[metrics["symbol"].isin(pool_set) & metrics["strategy1_pass"]].copy()
+    if passed.empty:
+        logger.info("Institutional strategy 1 selected: 0")
+        return []
+
+    metrics_by_code = passed.set_index("symbol").to_dict(orient="index")
+    date_str = pick_date.strftime("%Y-%m-%d")
+    candidates: List[Candidate] = []
+    for code in pool_codes:
+        row = metrics_by_code.get(code)
+        if row is None:
+            continue
+        prepared_df = prepared.get(code)
+        turnover_n = 0.0
+        if prepared_df is not None and pick_date in prepared_df.index and "turnover_n" in prepared_df.columns:
+            turnover_n = float(prepared_df.loc[pick_date, "turnover_n"])
+        close = row.get("market_close")
+        try:
+            close_value = float(close)
+        except (TypeError, ValueError):
+            close_value = np.nan
+        if not np.isfinite(close_value):
+            close_value = float(row.get("basic_close"))
+        candidates.append(Candidate(
+            code=code,
+            date=date_str,
+            strategy="institutional_1",
+            close=close_value,
+            turnover_n=turnover_n,
+            extra={
+                "total_mv": _round_float(row.get("total_mv"), 2),
+                "circ_mv": _round_float(row.get("circ_mv"), 2),
+                "debt_to_assets": _round_float(row.get("debt_to_assets"), 2),
+                "turnover_rate": _round_float(row.get("turnover_rate"), 2),
+                "pct_chg": _round_float(row.get("pct_chg"), 2),
+                "entry_amount_ratio": _round_float(row.get("entry_amount_ratio"), 4),
+                "amount_10k": _round_float(row.get("amount_10k"), 2),
+                "limit_up_days_ytd": _round_float(row.get("limit_up_days_ytd"), 0),
+                "n_cashflow_act": _round_float(row.get("n_cashflow_act"), 2),
+                "profit_dedt": _round_float(row.get("profit_dedt"), 2),
+                "main_net_ratio_pct": _round_float(row.get("main_net_ratio_pct"), 2),
+                "main_net_amount": _round_float(row.get("main_net_amount"), 2),
+            },
+        ))
+
+    logger.info("Institutional strategy 1 selected: %d", len(candidates))
+    return candidates
+
+
+def _legacy_strategies_enabled(cfg: dict) -> bool:
+    return any(
+        bool(cfg.get(name, {}).get("enabled", False))
+        for name in ("b1", "brick", "golden_needle", "kg_momentum")
+    )
+
+
+def _resolve_latest_sidecar_pick_date(sidecar_dir: Path, cfg_inst: dict, pick_date: Optional[str]) -> pd.Timestamp:
+    if pick_date:
+        return pd.to_datetime(pick_date)
+
+    template = str(cfg_inst.get("daily_market_file", "daily_market/{yyyymmdd}.csv"))
+    pattern_text = template.replace("{yyyymmdd}", "*.csv").replace("{date}", "*.csv")
+    pattern = _resolve_sidecar_path(pattern_text, data_dir=sidecar_dir)
+    files = list(pattern.parent.glob(pattern.name))
+    dates: list[pd.Timestamp] = []
+    for file in files:
+        match = re.search(r"(\d{8})", file.stem)
+        if match:
+            dates.append(pd.to_datetime(match.group(1), format="%Y%m%d"))
+    if not dates:
+        raise FileNotFoundError(f"no sidecar files match: {pattern}")
+    return max(dates)
+
+
+def _load_institutional_pool_codes(sidecar_dir: Path, pick_date: pd.Timestamp, cfg_inst: dict) -> List[str]:
+    daily_basic = _sidecar_source_frame(
+        sidecar_dir,
+        pick_date,
+        cfg_inst,
+        "daily_basic_file",
+        "daily_basic/{yyyymmdd}.csv",
+        ["total_mv"],
+    )
+    return daily_basic["symbol"].dropna().astype(str).str.zfill(6).drop_duplicates().tolist()
+
 
 def run_b1(
     prepared: Dict[str, pd.DataFrame],
@@ -534,6 +818,7 @@ def _round_float(value: object, ndigits: int = 2) -> Optional[float]:
     return round(val, ndigits)
 
 
+
 def _kg_signal_type(row: pd.Series, cfg_kg: dict) -> str:
     momentum = float(row.get("kg_momentum", np.nan))
     x_momentum = float(row.get("kg_x_momentum", np.nan))
@@ -699,10 +984,39 @@ def run_preselect(
     g = cfg.get("global", {})
 
     _data_dir_path = _resolve_cfg_path(data_dir or g.get("data_dir", "./data/raw"))
+    _metadata_dir_path = _resolve_cfg_path(g.get("metadata_dir", "./data/pit_metadata"))
     _data_dir = str(_data_dir_path)
     top_m = int(g.get("top_m", 20))
     n_turnover_days = int(g.get("n_turnover_days", 43))
     min_bars_buffer = int(g.get("min_bars_buffer", 10))
+    cfg_inst = cfg.get("institutional_filters", {}) or {}
+
+    if bool(cfg_inst.get("enabled", False)) and not _legacy_strategies_enabled(cfg):
+        pick_ts = _resolve_latest_sidecar_pick_date(
+            _metadata_dir_path,
+            cfg_inst,
+            pick_date or end_date,
+        )
+        logger.info("Institutional-only pick date: %s", pick_ts.date())
+        pool_codes = _load_institutional_pool_codes(_metadata_dir_path, pick_ts, cfg_inst)
+        logger.info("Institutional sidecar pool: %d", len(pool_codes))
+        pool_codes = _apply_universe_filters(
+            pool_codes,
+            pick_date=pick_ts,
+            sidecar_dir=_metadata_dir_path,
+            cfg=cfg,
+        )
+        if not pool_codes:
+            logger.warning("Institutional pool empty after universe filters, pick_date=%s", pick_ts.date())
+            return pick_ts, []
+        candidates = run_institutional_1(
+            {},
+            pick_ts,
+            pool_codes,
+            _metadata_dir_path,
+            cfg_inst,
+        )
+        return pick_ts, _merge_strategy_candidates(candidates)
 
     # 1) 加载原始数据
     raw_data = load_raw_data(_data_dir, end_date=end_date)
@@ -733,7 +1047,7 @@ def run_preselect(
     pool_codes = _apply_universe_filters(
         pool_codes,
         pick_date=pick_ts,
-        data_dir=_data_dir_path,
+        sidecar_dir=_metadata_dir_path,
         cfg=cfg,
     )
     if not pool_codes:
@@ -742,6 +1056,15 @@ def run_preselect(
 
     # 6) 运行各策略
     all_candidates: List[Candidate] = []
+
+    if cfg.get("institutional_filters", {}).get("enabled", False):
+        all_candidates.extend(run_institutional_1(
+            prepared,
+            pick_ts,
+            pool_codes,
+            _metadata_dir_path,
+            cfg.get("institutional_filters", {}),
+        ))
 
     if cfg.get("b1", {}).get("enabled", True):
         all_candidates.extend(run_b1(prepared, pick_ts, pool_codes, cfg["b1"]))
@@ -756,6 +1079,7 @@ def run_preselect(
             pool_codes,
             cfg.get("golden_needle", {}),
         ))
+
 
     if cfg.get("kg_momentum", {}).get("enabled", False):
         all_candidates.extend(run_kg_momentum(

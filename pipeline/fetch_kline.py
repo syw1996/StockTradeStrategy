@@ -243,6 +243,24 @@ def main(log_path: Optional[Path] = None):
     setup_logging(log_path)
     logger.info("日志文件：%s", Path(log_path).resolve())
 
+    mode = str(cfg.get("mode", "fetch")).strip().lower()
+    if mode == "reference":
+        source_dir = _resolve_cfg_path(cfg.get("source_dir", "./data/raw"))
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise FileNotFoundError(f"reference 日线目录不存在: {source_dir}")
+        sample_count = sum(1 for _ in source_dir.glob("*.csv"))
+        if sample_count == 0:
+            raise ValueError(f"reference 日线目录没有 CSV 文件: {source_dir}")
+        logger.info(
+            "使用 reference 日线目录，跳过 Tushare 日线下载: %s (%d csv)",
+            source_dir.resolve(),
+            sample_count,
+        )
+        logger.info("sidecar 数据请运行: python -m pipeline.fetch_sidecar_data --tasks all")
+        return
+    if mode != "fetch":
+        raise ValueError(f"未知 fetch_kline mode: {mode}")
+
     # ---------- Tushare Token ---------- #
     os.environ["NO_PROXY"] = "api.waditu.com,.waditu.com,waditu.com"
     os.environ["no_proxy"] = os.environ["NO_PROXY"]

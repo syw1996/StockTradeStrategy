@@ -2,6 +2,14 @@
 # fetch_kline.py 配置文件
 # ============================================================
 
+# 数据模式：
+#   reference = 使用成熟日线缓存目录，不重新下载日线
+#   fetch     = 使用 Tushare 下载日线到 out
+mode: "reference"
+
+# reference 模式下的日线缓存目录
+source_dir: "D:/projects/a_share_auto_quant/data_tools/kline_data"
+
 # 抓取日期范围（YYYYMMDD 或 'today'）
 start: "20190101"
 end: "today"

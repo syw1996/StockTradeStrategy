@@ -7,7 +7,7 @@ server:
 
 paths:
   candidates_latest: "data/candidates/candidates_latest.json"
-  raw_data_dir: "data/raw"
+  raw_data_dir: "D:/projects/a_share_auto_quant/data_tools/kline_data"
 
 chart:
   # 默认显示多少根K线（0 = 全部）

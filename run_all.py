@@ -116,8 +116,16 @@ def main() -> None:
     # ── 步骤 2：量化初选 ─────────────────────────────────────────────
     if start <= 2:
         _run(
+            "2a/4  fetch sidecar data",
+            [PYTHON, "-m", "pipeline.fetch_sidecar_data", "--tasks", "daily,limit,financial"],
+        )
+        _run(
             "2/4  量化初选（cli preselect）",
             [PYTHON, "-m", "pipeline.cli", "preselect"],
+        )
+        _run(
+            "2b/4  institutional 60m second-stage filter",
+            [PYTHON, "-m", "pipeline.institutional_60m", "--replace-latest"],
         )
 
     # ── 步骤 3：导出 K 线图 ──────────────────────────────────────────

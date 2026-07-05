@@ -1,25 +1,65 @@
 # rules_preselect.yaml
-# 量化初选规则配置文件
-# pipeline/select_stock.py 读取本文件中的参数
+# Daily preselection and institutional strategy settings.
 
-# ── 全局设置 ─────────────────────────────────────────────────────────
 global:
-  data_dir: "./data/raw"          # A股日线CSV目录
-  output_dir: "./data/candidates" # 候选结果输出目录
-  top_m: 5000                     # 流动性池：取成交额最高的 top_m 只
-  n_turnover_days: 43             # 滚动成交额窗口（日）
-  min_bars_buffer: 10             # 额外的最小 bar 缓冲
+  data_dir: "D:/projects/a_share_auto_quant/data_tools/kline_data"
+  metadata_dir: "./data/pit_metadata"
+  output_dir: "./data/candidates"
+  top_m: 6000
+  n_turnover_days: 43
+  min_bars_buffer: 10
 
-# ── 股票池过滤 ───────────────────────────────────────────────────────
 universe_filters:
   exclude_st: true
-  min_total_mv: 1000000            # 最小总市值，单位：万元；1000000 = 100亿
-  market_cap_file: "pit_metadata/daily_basic/{yyyymmdd}.csv"
-  validation_file_template: "daily_update_validation_{yyyymmdd}.csv"
+  min_total_mv: 1000000
+  market_cap_file: "daily_basic/{yyyymmdd}.csv"
+  validation_file_template: "stock_st/{yyyymmdd}.csv"
 
-# ── B1 策略参数（KDJ + 知行均线多头排列） ────────────────────────────
-b1:
+institutional_filters:
   enabled: true
+  min_total_mv: 2000000
+  min_circ_mv: 200000
+  max_debt_to_assets: 80
+  min_turnover_rate: 3
+  min_pct_chg: 2
+  min_entry_amount_ratio: 0.10
+  min_limit_up_days_ytd: 1
+  require_oper_cashflow_positive: true
+  require_profit_dedt_positive: true
+  min_main_net_ratio_pct: 0.5
+  daily_basic_file: "daily_basic/{yyyymmdd}.csv"
+  daily_market_file: "daily_market/{yyyymmdd}.csv"
+  financial_file: "financial_latest/{yyyymmdd}.csv"
+  limit_up_ytd_file: "limit_up_ytd/{yyyymmdd}.csv"
+  moneyflow_dc_file: "moneyflow_dc/{yyyymmdd}.csv"
+  moneyflow_fallback_file: "moneyflow/{yyyymmdd}.csv"
+
+institutional_60m:
+  enabled: true
+  kline_dir: "./data/kline_60m"
+  lookback_days: 120
+  min_bars: 80
+  ma_window: 60
+  ma_slope_window: 5
+  min_ma60_slope: 0.0
+  require_close_above_ma60: true
+  max_distance_above_ma60: 0.12
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  require_macd_hist_positive: true
+  boll_window: 20
+  boll_std: 2.0
+  max_boll_width: 0.12
+  use_dynamic_boll_width: true
+  boll_width_quantile_lookback: 120
+  boll_width_quantile: 0.80
+  beauty_lookback: 5
+  recent_low_ma60_tolerance: -0.02
+  recent_high_lift_min: 0.0
+
+b1:
+  enabled: false
   zx_m1: 14
   zx_m2: 28
   zx_m3: 57
@@ -27,61 +67,47 @@ b1:
   j_threshold: 15.0
   j_q_threshold: 0.10
 
-# ── 黄金针/白金针策略参数（通达信 RSL 公式）──────────────────────────────
 golden_needle:
-  enabled: true
-  n1: 3                         # 短期窗口；截图默认 3
-  n2: 21                        # 长期窗口；截图默认 21
-  include_platinum: true        # true = COND1-6，false = 只选 A黄金针 COND1/COND2
-  cond1_long_min: 79            # 截图口径可改为 80
+  enabled: false
+  n1: 3
+  n2: 21
+  include_platinum: true
+  cond1_long_min: 79
   cond1_short_max: 30
   cond2_gap_min: 58
-  cond2_long_min: 70            # 截图口径可改为 75
-  cond6_count_window: 8         # COUNT(短期 < 75, 8) >= 4
+  cond2_long_min: 70
+  cond6_count_window: 8
   cond6_count_min: 4
   cond6_count_short_max: 75
-  cond6_long_window: 9          # EVERY(长期 > 85, 9)
+  cond6_long_window: 9
   cond6_long_min: 85
-  cond6_short_max: 60           # 当日短期 < 60
+  cond6_short_max: 60
 
-# ── KG/JRX 动能策略参数（黄柱 + X动能 + 真实得分）────────────────────────────
+
 kg_momentum:
-  enabled: true
-  mode: "both"                  # both = reversal + trend_continue；也可选 momentum_rebound
-
-  # 甜点A：小动能 + 强 X 动能，偏洗盘后反转
+  enabled: false
+  mode: "both"
   reversal_momentum_max: 20
   reversal_x_min: 50
   require_score_for_reversal: false
-
-  # 甜点B原始动能：适中动能 + 适中 X 动能 + 分数甜点区
-  # 单独 mode=momentum_rebound 时用于观察左侧/下跌后的动能反抽。
   trend_momentum_min: 30
   trend_momentum_max: 50
   trend_x_min: 30
   trend_x_max: 50
   score_min: 10
   score_max: 50
-
-  # 真正趋势延续过滤：默认要求站上 MA20，且 MA20 近 5 日斜率非负。
-  # 如需更右侧，可打开 close > MA60 / MA20 > MA60 / MA60 slope 约束。
   trend_require_close_above_ma20: true
   trend_ma20_slope_min: 0.0
   trend_require_close_above_ma60: false
   trend_ma60_slope_min: null
   trend_require_ma20_above_ma60: false
   trend_low20_distance_min: null
-
-  # 风险约束：动能过热时胜率劣化；红柱绘制口径要求成交量不弱于昨日九成
   overheat_momentum_max: 60
   require_volume_confirm: true
   volume_ratio_min: 0.9
 
-# ── 砖型图（BrickChart）策略参数 ──────────────────────────────────────
 brick:
-  enabled: true
-
-  # 砖型图计算参数（Z哥 skill / 通达信短期砖型图标准口径）
+  enabled: false
   n: 4
   m1: 4
   m2: 6
@@ -92,22 +118,16 @@ brick:
   sma_w1: 1
   sma_w2: 1
   sma_w3: 1
-
-  # 选股过滤阈值
-  daily_return_threshold: 0.2    # 今日涨幅上限
-  brick_growth_ratio: 0.5         # 今日红柱 >= N × 昨日绿柱绝对值
-  min_prior_green_bars: 1         # 红柱前至少有几根连续绿柱
-
-  # 知行线参数
-  zxdq_ratio: 1.47                 # 收盘价 < zxdq × ratio；null = 不启用
+  daily_return_threshold: 0.2
+  brick_growth_ratio: 0.5
+  min_prior_green_bars: 1
+  zxdq_ratio: 1.47
   zxdq_span: 10
   require_zxdq_gt_zxdkx: true
   zxdkx_m1: 14
   zxdkx_m2: 28
   zxdkx_m3: 57
   zxdkx_m4: 114
-
-  # 周线均线多头排列
   require_weekly_ma_bull: true
   wma_short: 5
   wma_mid: 10

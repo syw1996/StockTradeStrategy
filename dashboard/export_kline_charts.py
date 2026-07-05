@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import yaml
 
 # ── 路径设置 ──────────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).parent.parent
@@ -26,6 +27,19 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "dashboard"))
 
 from components.charts import make_daily_chart, make_weekly_chart  # noqa: E402
+
+
+def _resolve_project_path(path_like: str | Path) -> Path:
+    p = Path(path_like)
+    return p if p.is_absolute() else (_ROOT / p)
+
+
+def _load_dashboard_cfg() -> dict:
+    cfg_path = _ROOT / "config" / "dashboard.yaml"
+    if not cfg_path.exists():
+        return {}
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
 # ── 数据加载 ──────────────────────────────────────────────────────────────────
@@ -75,9 +89,12 @@ def _export_fig(fig, out_path: Path, width: int, height: int) -> None:
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
 # 配置字典（直接修改此处）
+_DASHBOARD_CFG = _load_dashboard_cfg()
+_PATH_CFG = _DASHBOARD_CFG.get("paths", {})
+
 CONFIG = {
-    "candidates": str(_ROOT / "data" / "candidates" / "candidates_latest.json"),
-    "raw_dir":    str(_ROOT / "data" / "raw"),
+    "candidates": str(_resolve_project_path(_PATH_CFG.get("candidates_latest", "data/candidates/candidates_latest.json"))),
+    "raw_dir":    str(_resolve_project_path(_PATH_CFG.get("raw_data_dir", "data/raw"))),
     "out_dir":    str(_ROOT / "data" / "kline"),
     "bars":       120,   # 日线显示 K 线数量（0 = 全部）
     "weekly_bars": 60,   # 周线显示 K 线数量（0 = 全部）

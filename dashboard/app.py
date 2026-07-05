@@ -32,6 +32,11 @@ def _load_cfg() -> dict:
             return yaml.safe_load(f) or {}
     return {}
 
+
+def _resolve_project_path(path_like: str | Path) -> Path:
+    p = Path(path_like)
+    return p if p.is_absolute() else (_ROOT / p)
+
 @st.cache_data(ttl=30)
 def _load_candidates_map() -> dict[str, dict]:
     cfg = _load_cfg()
@@ -47,7 +52,7 @@ def _load_candidates_map() -> dict[str, dict]:
 @st.cache_data(show_spinner=False)
 def _load_raw(code: str) -> pd.DataFrame:
     cfg = _load_cfg()
-    raw_dir = _ROOT / cfg.get("paths", {}).get("raw_data_dir", "data/raw")
+    raw_dir = _resolve_project_path(cfg.get("paths", {}).get("raw_data_dir", "data/raw"))
     csv = raw_dir / f"{code}.csv"
     if not csv.exists():
         return pd.DataFrame()
@@ -148,7 +153,7 @@ else:
 df_raw = _load_raw(active_code)
 
 if df_raw.empty:
-    st.error(f"❌ 未找到 `data/raw/{active_code}.csv`，请先抓取数据。")
+    st.error(f"❌ 未找到 `{active_code}.csv`，请检查日线数据目录配置。")
     st.stop()
 
 # ── 图表 ─────────────────────────────────────────────────────────────────────
