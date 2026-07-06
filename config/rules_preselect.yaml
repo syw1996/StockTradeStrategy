@@ -8,6 +8,11 @@ global:
   top_m: 6000
   n_turnover_days: 43
   min_bars_buffer: 10
+  price_adjustment:
+    enabled: true
+    method: "qfq"
+    adj_factor_dir: "./data/pit_metadata/adj_factor_by_code"
+    on_missing: "error"
 
 universe_filters:
   exclude_st: true
@@ -111,7 +116,7 @@ divergence_buy:
   macd_signal: 9
   macd_close_dea_max: 0.05
   right_side_filter:
-    enabled: false
+    enabled: true
     ma_short: 20
     ma_long: 60
     ma_slope_window: 5

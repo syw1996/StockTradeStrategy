@@ -1238,7 +1238,7 @@ class DivergenceBuyPatternFilter:
     macd_slow: int = 26
     macd_signal: int = 9
     macd_close_dea_max: float = 0.05
-    right_side_enabled: bool = False
+    right_side_enabled: bool = True
     right_ma_short: int = 20
     right_ma_long: int = 60
     right_ma_slope_window: int = 5
@@ -1672,7 +1672,7 @@ class DivergenceBuySelector(PipelineSelector):
         macd_slow: int = 26,
         macd_signal: int = 9,
         macd_close_dea_max: float = 0.05,
-        right_side_enabled: bool = False,
+        right_side_enabled: bool = True,
         right_ma_short: int = 20,
         right_ma_long: int = 60,
         right_ma_slope_window: int = 5,

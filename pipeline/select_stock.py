@@ -30,6 +30,7 @@ from Selector import (
     KGMomentumSelector,
 )
 from pipeline_core import MarketDataPreparer, TopTurnoverPoolBuilder
+from price_adjust import apply_price_adjustment
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ def resolve_preselect_output_dir(
 def load_raw_data(
     data_dir: str,
     end_date: Optional[str] = None,
+    price_adjustment: Optional[dict] = None,
 ) -> Dict[str, pd.DataFrame]:
     """读取 data_dir 下六位股票代码 CSV，统一处理列名/日期/排序."""
     if not os.path.isdir(data_dir):
@@ -110,7 +112,7 @@ def load_raw_data(
     logger.info("读取股票数量: %d", len(data))
     if skipped_non_stock:
         logger.info("跳过非个股 CSV: %d 个", skipped_non_stock)
-    return data
+    return apply_price_adjustment(data, price_adjustment, project_root=_PROJECT_ROOT)
 
 
 # =============================================================================
@@ -185,7 +187,7 @@ def _calc_warmup(cfg: dict, buffer: int) -> int:
             + int(cfg_divergence.get("macd_signal", 9))
             + buffer,
         )
-        if bool(right_cfg.get("enabled", cfg_divergence.get("right_side_enabled", False))):
+        if bool(right_cfg.get("enabled", cfg_divergence.get("right_side_enabled", True))):
             warmup = max(
                 warmup,
                 int(right_cfg.get("ma_long", 60)) + buffer,
@@ -865,7 +867,7 @@ def run_divergence_buy(
 ) -> List[Candidate]:
     """Run the upgraded divergence buy strategy."""
     right_cfg = cfg_divergence.get("right_side_filter", {}) or {}
-    right_side_enabled = bool(right_cfg.get("enabled", cfg_divergence.get("right_side_enabled", False)))
+    right_side_enabled = bool(right_cfg.get("enabled", cfg_divergence.get("right_side_enabled", True)))
     selector = DivergenceBuySelector(
         mode=str(cfg_divergence.get("mode", "confirmed")),
         n1=int(cfg_divergence.get("n1", 3)),
@@ -1142,7 +1144,11 @@ def run_preselect(
         return pick_ts, _merge_strategy_candidates(candidates)
 
     # 1) 加载原始数据
-    raw_data = load_raw_data(_data_dir, end_date=end_date)
+    raw_data = load_raw_data(
+        _data_dir,
+        end_date=end_date,
+        price_adjustment=g.get("price_adjustment", {}),
+    )
 
     # 2) 计算 warmup_bars
     warmup = _calc_warmup(cfg, min_bars_buffer)

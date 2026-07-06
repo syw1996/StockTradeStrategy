@@ -113,6 +113,14 @@ python -m pipeline.fetch_kline
 
 ### 步骤 2：量化初选
 
+初选默认使用前复权口径计算 B1/KDJ、知行线、砖型图和周线过滤。首次运行或切换日期前，先把 Tushare 复权因子缓存到本项目内：
+
+~~~bash
+python -m pipeline.fetch_sidecar_data --tasks adj_factor --as-of 2026-07-06 --workers 4
+~~~
+
+缓存目录为 `data/pit_metadata/adj_factor_by_code`。`config/rules_preselect.yaml` 中 `global.price_adjustment.on_missing` 默认为 `error`，如果因子缺失或覆盖日期不足会直接中止，避免混用未复权与前复权数据。
+
 ~~~bash
 python -m pipeline.cli preselect
 ~~~
@@ -165,6 +173,7 @@ python agent/gemini_review.py --config config/gemini_review.yaml
 ### 6.2 初选层
 
 - top_m 决定流动性股票池大小
+- price_adjustment 控制前复权口径；默认 qfq，需要先缓存 adj_factor
 - b1.enabled、brick.enabled、golden_needle.enabled、kg_momentum.enabled 控制策略开关
 - 可先只开一个策略做回放验证
 

@@ -27,6 +27,7 @@ DAILY_MARKET_FIELDS = (
 STOCK_ST_FIELDS = "ts_code,name,trade_date,type,type_name"
 FINA_FIELDS = "ts_code,ann_date,end_date,profit_dedt,debt_to_assets"
 CASHFLOW_FIELDS = "ts_code,ann_date,end_date,n_cashflow_act"
+ADJ_FACTOR_FIELDS = "ts_code,trade_date,adj_factor"
 MONEYFLOW_DC_FIELDS = (
     "trade_date,ts_code,name,pct_change,close,net_amount,net_amount_rate,"
     "buy_elg_amount,buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
@@ -449,11 +450,98 @@ def fetch_financial_latest(
     }
 
 
+def fetch_one_adj_factor(
+    client: TushareClient,
+    ts_code: str,
+    *,
+    start: str,
+    end: str,
+    raw_dir: Path,
+    refresh: bool,
+) -> dict[str, object]:
+    symbol = _symbol_from_ts_code(ts_code)
+    path = raw_dir / f"{symbol}.csv"
+    if path.exists() and not refresh:
+        cached = pd.read_csv(path, dtype={"ts_code": str, "trade_date": str})
+        cached_dates = cached.get("trade_date", pd.Series(dtype=str)).astype(str)
+        if (
+            not cached.empty
+            and str(cached_dates.min()) <= start
+            and str(cached_dates.max()) >= end
+        ):
+            return {"ts_code": ts_code, "symbol": symbol, "rows": int(len(cached)), "cached": True}
+
+    df = client.call(
+        "adj_factor",
+        ts_code=ts_code,
+        start_date=start,
+        end_date=end,
+        fields=ADJ_FACTOR_FIELDS,
+    )
+    _write_csv(df, path, ADJ_FACTOR_FIELDS.split(","))
+    return {"ts_code": ts_code, "symbol": symbol, "rows": int(len(df)), "cached": False}
+
+
+def fetch_adj_factors_by_code(
+    client: TushareClient,
+    *,
+    start: str,
+    end: str,
+    out_dir: Path,
+    stocklist: Path,
+    workers: int,
+    limit_codes: int,
+    refresh: bool,
+) -> dict[str, object]:
+    codes = _read_codes(stocklist, limit_codes=limit_codes)
+    raw_dir = out_dir / "adj_factor_by_code"
+    rows: list[dict[str, object]] = []
+    failures: list[dict[str, str]] = []
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {
+            executor.submit(
+                fetch_one_adj_factor,
+                client,
+                ts_code,
+                start=start,
+                end=end,
+                raw_dir=raw_dir,
+                refresh=refresh,
+            ): ts_code
+            for ts_code in codes
+        }
+        for idx, future in enumerate(as_completed(futures), 1):
+            ts_code = futures[future]
+            try:
+                row = future.result()
+                rows.append(row)
+                print(f"[adj_factor {idx}/{len(codes)}] {ts_code} rows={row['rows']}")
+            except Exception as exc:
+                failures.append({"ts_code": ts_code, "error": str(exc)})
+                print(f"[adj_factor {idx}/{len(codes)}] failed {ts_code}: {exc}")
+
+    summary_path = out_dir / "adj_factor_by_code_summary" / f"{end}.csv"
+    _write_csv(pd.DataFrame(rows), summary_path)
+    if failures:
+        fail_path = out_dir / "adj_factor_by_code_summary" / f"{end}_failures.csv"
+        _write_csv(pd.DataFrame(failures), fail_path)
+    return {
+        "start": start,
+        "end": end,
+        "codes_requested": len(codes),
+        "adj_factor_files": len(rows),
+        "adj_factor_failures": len(failures),
+        "adj_factor_dir": str(raw_dir),
+        "adj_factor_summary_path": str(summary_path),
+    }
+
+
 def parse_tasks(value: str) -> set[str]:
     tasks = {part.strip().lower() for part in value.split(",") if part.strip()}
     if "all" in tasks:
         return {"daily", "limit", "financial"}
-    valid = {"daily", "limit", "financial"}
+    valid = {"daily", "limit", "financial", "adj_factor"}
     invalid = tasks - valid
     if invalid:
         raise ValueError(f"Invalid task(s): {', '.join(sorted(invalid))}")
@@ -465,15 +553,16 @@ def main() -> None:
         description="Fetch StockTradebyZ sidecar data into data/pit_metadata.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--tasks", default="daily", help="daily,limit,financial,all")
+    parser.add_argument("--tasks", default="daily", help="daily,limit,financial,adj_factor,all")
     parser.add_argument("--as-of", default="today", help="YYYYMMDD, YYYY-MM-DD, or today")
+    parser.add_argument("--start", default="19900101", help="YYYYMMDD start date for adj_factor")
     parser.add_argument("--out", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--stocklist", default=str(DEFAULT_STOCKLIST))
     parser.add_argument("--incremental", action="store_true", default=True)
     parser.add_argument("--no-incremental", dest="incremental", action="store_false")
     parser.add_argument("--refresh-financial", action="store_true", default=False)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--limit-codes", type=int, default=0, help="debug helper for financial task")
+    parser.add_argument("--limit-codes", type=int, default=0, help="debug helper for financial/adj_factor tasks")
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-wait", type=float, default=0.8)
     args = parser.parse_args()
@@ -483,6 +572,7 @@ def main() -> None:
     stocklist = _resolve_project_path(args.stocklist)
     client = TushareClient(retries=args.retries, retry_wait=args.retry_wait)
     as_of = _normalize_date(args.as_of)
+    start = _normalize_date(args.start)
     trade_date = find_trade_date(client, as_of)
 
     started = time.perf_counter()
@@ -518,6 +608,18 @@ def main() -> None:
             workers=args.workers,
             limit_codes=args.limit_codes,
             refresh=args.refresh_financial,
+        )
+
+    if "adj_factor" in tasks:
+        summary["adj_factor"] = fetch_adj_factors_by_code(
+            client,
+            start=start,
+            end=trade_date,
+            out_dir=out_dir,
+            stocklist=stocklist,
+            workers=args.workers,
+            limit_codes=args.limit_codes,
+            refresh=not args.incremental,
         )
 
     summary["seconds"] = round(time.perf_counter() - started, 3)
